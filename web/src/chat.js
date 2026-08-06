@@ -416,6 +416,14 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
     // the session.
     autoAllowTools: [],
 
+    // --- File upload state ---
+    // fileUploadEnabled is loaded from GET /api/config on init. When false,
+    // the upload button and drop zone are hidden — zero overhead.
+    fileUploadEnabled: false,
+    // attachments holds files the user has selected/dropped before sending.
+    // Each entry: { name, mime_type, data_url, size, preview }
+    attachments: [],
+
     // --- Sidebar toggle (conversation history list) ---
     // Hosts that render a collapsible sidebar (e.g. knot's floating window)
     // bind this to a toggle button. Full-page hosts can leave it true.
@@ -455,6 +463,7 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
           this.loadCommands(),
           this.loadPrompts(),
           this.loadResources(),
+          this.loadConfig(),
         ]);
       }).then(() => {
         // Apply the last-used (or Default) persona + model to the setup
@@ -936,6 +945,15 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
           this._storeETag("resources", r);
           const data = await r.json();
           this.resources = Array.isArray(data) ? data : [];
+        }
+      } catch {}
+    },
+    async loadConfig() {
+      try {
+        const r = await fetch(`${this.prefix}/api/config`);
+        if (r.ok) {
+          const data = await r.json();
+          this.fileUploadEnabled = !!data.file_upload;
         }
       } catch {}
     },
@@ -1537,9 +1555,9 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
 
     async send() {
       const draft = this.draft.trim();
-      if (!draft || this.streaming) return;
+      if ((!draft && this.attachments.length === 0) || this.streaming) return;
 
-      this.recordInputHistory(draft);
+      if (draft) this.recordInputHistory(draft);
 
       // Built-in meta commands (don't go to the model directly)
       if (draft === "/list-prompts") {
@@ -1582,12 +1600,39 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       // server-side. The browser sends the text as-is; the server
       // reads the resources and builds content blocks. No client-side
       // fetch or attachment handling needed.
-      const msg = { id: "msg-" + (++_msgSeq), role: "user", content: draft };
+      //
+      // When attachments are present, build an OpenAI-style content array
+      // with image_url blocks for images and text blocks for text files,
+      // followed by the user's text message.
+      let content;
+      const pending = this.attachments.splice(0);
+      if (pending.length > 0) {
+        const blocks = [];
+        for (const att of pending) {
+          if (att.mime_type.startsWith("image/")) {
+            blocks.push({ type: "image_url", image_url: { url: att.data_url } });
+          } else {
+            // Non-image files: include as text with a label.
+            // Strip the data URL prefix to get raw base64, then decode.
+            const b64 = att.data_url.replace(/^data:[^;]+;base64,/, "");
+            let text;
+            try { text = atob(b64); } catch { text = "[binary file: " + att.name + "]"; }
+            blocks.push({ type: "text", text: "File " + att.name + ":\n" + text });
+          }
+        }
+        if (draft) {
+          blocks.push({ type: "text", text: draft });
+        }
+        content = blocks;
+      } else {
+        content = draft;
+      }
+      const msg = { id: "msg-" + (++_msgSeq), role: "user", content };
       this.messages.push(msg);
       this.draft = "";
       const c = this.current;
       if (c && c.title === "New conversation") {
-        c.title = draft.slice(0, 50);
+        c.title = draft ? draft.slice(0, 50) : (pending.length ? pending[0].name : "New conversation");
       }
       this.jumpToBottom();
       this.persist();
@@ -1623,6 +1668,85 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
       try {
         sessionStorage.setItem("lmchatkit:inputHistory", JSON.stringify(this.inputHistory));
       } catch {}
+    },
+
+    // --- File upload helpers ---
+    // pickFiles opens a native file picker. Accepted files are uploaded to
+    // the server which returns base64 data URLs. Multiple files supported.
+    pickFiles() {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.multiple = true;
+      input.accept = "image/*,.pdf,.txt,.md,.csv,.json,.xml,.html";
+      input.onchange = async () => {
+        if (!input.files || !input.files.length) return;
+        await this.uploadFiles(input.files);
+      };
+      input.click();
+    },
+
+    // handleFileDrop processes files from a drag-and-drop event.
+    async handleFileDrop(e) {
+      if (!this.fileUploadEnabled) return;
+      e.preventDefault();
+      const files = e.dataTransfer?.files;
+      if (!files || !files.length) return;
+      await this.uploadFiles(files);
+    },
+
+    // handleFilePaste processes pasted images from clipboard.
+    async handleFilePaste(e) {
+      if (!this.fileUploadEnabled) return;
+      const items = e.clipboardData?.items;
+      if (!items) return;
+      const files = [];
+      for (const item of items) {
+        if (item.kind === "file") {
+          const f = item.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+      if (files.length > 0) {
+        e.preventDefault();
+        await this.uploadFiles(files);
+      }
+    },
+
+    // uploadFiles sends files to POST /api/upload and appends results to
+    // the attachments array.
+    async uploadFiles(fileList) {
+      const formData = new FormData();
+      for (const f of fileList) {
+        formData.append("file", f);
+      }
+      try {
+        const r = await fetch(`${this.prefix}/api/upload`, {
+          method: "POST",
+          body: formData,
+        });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({ error: "upload failed" }));
+          console.warn("upload failed:", err.error || r.status);
+          return;
+        }
+        const data = await r.json();
+        if (data.files) {
+          for (const f of data.files) {
+            this.attachments.push({
+              name: f.name,
+              mime_type: f.mime_type,
+              data_url: f.data_url,
+              size: f.size,
+            });
+          }
+        }
+      } catch (e) {
+        console.warn("upload error:", e.message);
+      }
+    },
+
+    removeAttachment(idx) {
+      this.attachments.splice(idx, 1);
     },
 
     async streamTurn() {

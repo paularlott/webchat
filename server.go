@@ -53,17 +53,27 @@ type Config struct {
 	// sync and push notifications (tools/prompts/resources changed).
 	// nil = no SSE (browser falls back to polling on chat completion).
 	Events *EventBroadcaster
+
+	// FileUpload enables the file-upload button in the chat composer.
+	// When true, users can attach images (and other files) which are
+	// sent to the LLM as base64-encoded content blocks. Default false —
+	// hosts opt in explicitly.
+	FileUpload bool
+
+	// MaxUploadBytes caps the size of a single uploaded file. Zero uses
+	// the default (10 MB).
+	MaxUploadBytes int64
 }
 
 // Server is a self-contained chat UI + backend. Build one with [New] and
 // mount it into any *http.ServeMux via [Server.Mount].
 type Server struct {
-	cfg             Config
-	personas        PersonaSource
-	personasCloser  io.Closer // non-nil when we own a file-backed personaStore
-	commands        CommandSource
-	commandsCloser  io.Closer // non-nil when we own a file-backed commandStore
-	host            Host
+	cfg            Config
+	personas       PersonaSource
+	personasCloser io.Closer // non-nil when we own a file-backed personaStore
+	commands       CommandSource
+	commandsCloser io.Closer // non-nil when we own a file-backed commandStore
+	host           Host
 }
 
 // New builds a Server, eagerly loading personas and slash commands from the
@@ -162,6 +172,12 @@ func (s *Server) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST "+prefix+"/api/prompts/get", wrapf(s.handleGetPrompt))
 	mux.HandleFunc("GET "+prefix+"/api/resources", wrapf(s.handleListResources))
 	mux.HandleFunc("POST "+prefix+"/api/resources/read", wrapf(s.handleReadResource))
+	mux.HandleFunc("GET "+prefix+"/api/config", wrapf(s.handleConfig))
+
+	// File upload — only mounted when enabled in Config.
+	if s.cfg.FileUpload {
+		mux.HandleFunc("POST "+prefix+"/api/upload", wrapf(s.handleUpload))
+	}
 
 	// Static assets (chat.js, chat.css, markdown.js bundles).
 	mux.HandleFunc("GET "+prefix+"/assets/", wrapf(s.handleAsset))
