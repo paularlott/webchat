@@ -1893,23 +1893,32 @@ function lmchatkit({ prefix, browserOnly = false, autoStartChat = false }) {
           reactiveAssistant.content += "\n```";
         }
 
-        // If the stream ended with only an error (no real content, no tool
-        // calls), remove the failed assistant bubble entirely. Leaving it
-        // in the messages array would send the error text to the API on
-        // the next turn as if it were a real assistant response — which
-        // pollutes the conversation and can cause some models to behave
-        // oddly. A clean retry should start from the same state as before
-        // the failed turn.
+        // If the stream ended with no usable content (error or empty), the
+        // assistant bubble must not be stripped or left blank — stripping it
+        // leaves back-to-back user messages in history, which many providers
+        // reject on the next turn. Replace the error/empty content with a
+        // neutral placeholder so the conversation stays structurally valid.
         const isErrorResponse = reactiveAssistant.content.startsWith("[stream error]") ||
           reactiveAssistant.content.startsWith("[error]");
         const hasRealContent = reactiveAssistant.content && !isErrorResponse;
         const hasToolCalls = reactiveAssistant.tool_calls.length > 0;
 
-        if (isErrorResponse && !hasToolCalls) {
-          // Strip the failed bubble so the conversation is clean for retry.
-          const lastIdx = this.messages.length - 1;
-          if (lastIdx >= 0 && this.messages[lastIdx] === reactiveAssistant) {
-            this.messages.splice(lastIdx, 1);
+        if (!hasRealContent && !hasToolCalls) {
+          reactiveAssistant.content = "(No response was received from the model.)";
+          // Neutralise image content in the preceding user message so it
+          // doesn't keep poisoning every subsequent turn. The model couldn't
+          // process the image (e.g. unsupported format like SVG), and leaving
+          // it in history causes every future request to fail the same way.
+          // Text blocks are preserved; only image_url blocks are replaced.
+          const userIdx = this.messages.length - 2;
+          if (userIdx >= 0 && this.messages[userIdx] &&
+              this.messages[userIdx].role === "user" &&
+              Array.isArray(this.messages[userIdx].content)) {
+            this.messages[userIdx].content = this.messages[userIdx].content.map((part) =>
+              part.type === "image_url"
+                ? { type: "text", text: "[image removed]" }
+                : part
+            );
           }
         }
 
